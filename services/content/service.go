@@ -32,11 +32,11 @@ func init() {
 			plugin.ServicePlugin,
 		},
 		InitFn: func(ic *plugin.InitContext) (interface{}, error) {
-			plugins, err := ic.GetByType(plugin.ServicePlugin)
+			plugins, err := ic.GetByType(plugin.ServicePlugin) // 按类型获取
 			if err != nil {
 				return nil, err
 			}
-			p, ok := plugins[services.ContentService]
+			p, ok := plugins[services.ContentService] // --> 这里是 contentService 插件
 			if !ok {
 				return nil, errors.New("content store service not found")
 			}

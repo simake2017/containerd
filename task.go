@@ -147,17 +147,33 @@ func (i *TaskInfo) Runtime() string {
 	return i.runtime
 }
 
-// Task is the executable object within containerd
+// Task 是容器的运行实例——封装了进程生命周期管理
+// wy: 🚀 Task 与 Container 的关系:
+//   - Container = 元数据对象（ID、Image、Spec、SnapshotKey），不运行进程
+//   - Task = 运行实例（有 PID、状态、IO），对应 shim 进程管理的容器
+//   - 一个 Container 同一时刻最多有一个 Task
+//
+// Task 的生命周期状态机:
+//   Created → Running → Stopped
+//              ↕
+//            Paused ↔ Pausing
+//
+// 所有 Task 方法最终都转化为 gRPC 调用:
+//   Client Task → gRPC → Daemon TaskService → TTRPC → Shim → runc
 type Task interface {
-	Process
+	Process // wy: 继承基础进程接口: Start, Kill, Wait, Delete, CloseIO, Resize, IO, Status
 
 	// Pause suspends the execution of the task
+	// wy: 暂停容器 → 底层: runc pause（通过 cgroup freezer 冻结所有进程）
 	Pause(context.Context) error
 	// Resume the execution of the task
+	// wy: 恢复容器 → 底层: runc resume（解冻 cgroup freezer）
 	Resume(context.Context) error
 	// Exec creates a new process inside the task
+	// wy: 在运行中的容器内创建新进程 → 底层: runc exec --process <spec.json>
 	Exec(context.Context, string, *specs.Process, cio.Creator) (Process, error)
 	// Pids returns a list of system specific process ids inside the task
+	// wy: 列出容器内所有进程 PID → 底层: 读取 cgroup 的 cgroup.procs 文件
 	Pids(context.Context) ([]ProcessInfo, error)
 	// Checkpoint serializes the runtime and memory information of a task into an
 	// OCI Index that can be pushed and pulled from a remote resource.
@@ -165,8 +181,10 @@ type Task interface {
 	// Additional software like CRIU maybe required to checkpoint and restore tasks
 	// NOTE: Checkpoint supports to dump task information to a directory, in this way,
 	// an empty OCI Index will be returned.
+	// wy: 容器检查点（热迁移）→ 底层: CRIU 序列化进程内存状态到文件
 	Checkpoint(context.Context, ...CheckpointTaskOpts) (Image, error)
 	// Update modifies executing tasks with updated settings
+	// wy: 运行时更新容器资源限制 → 底层: 写入 cgroup 文件（如 memory.limit_in_bytes）
 	Update(context.Context, ...UpdateTaskOpts) error
 	// LoadProcess loads a previously created exec'd process
 	LoadProcess(context.Context, string, cio.Attach) (Process, error)
@@ -175,6 +193,7 @@ type Task interface {
 	// The metric types are generic to containerd and change depending on the runtime
 	// For the built in Linux runtime, github.com/containerd/cgroups.Metrics
 	// are returned in protobuf format
+	// wy: 获取容器指标 → 底层: 读取 cgroup 统计文件（cpu.stat, memory.stat 等）
 	Metrics(context.Context) (*types.Metric, error)
 	// Spec returns the current OCI specification for the task
 	Spec(context.Context) (*oci.Spec, error)
@@ -206,6 +225,11 @@ func (t *task) Pid() uint32 {
 	return t.pid
 }
 
+// Start 启动容器的 init 进程
+// wy: 🚀 调用链: Client → gRPC → Daemon → TTRPC → Shim → runc start <id>
+// 此前 NewTask() 已执行了 runc create（设置了 namespaces/cgroups/rootfs），
+// init 进程处于阻塞状态（等待 start 信号）
+// Start 就是通知 init 进程开始执行
 func (t *task) Start(ctx context.Context) error {
 	r, err := t.client.TaskService().Start(ctx, &tasks.StartRequest{
 		ContainerID: t.id,
@@ -217,10 +241,14 @@ func (t *task) Start(ctx context.Context) error {
 		}
 		return errdefs.FromGRPC(err)
 	}
-	t.pid = r.Pid
+	t.pid = r.Pid // wy: 更新 PID（Start 后 runc 返回真实的 init 进程 PID）
 	return nil
 }
 
+// Kill 向容器发送信号
+// wy: 🚀 调用链: Client → gRPC → Daemon → TTRPC → Shim → runc kill [signal] [--all]
+// 底层实现: runc 通过 cgroup 找到容器内所有 PID，调用 kill() 系统调用
+// All=true 时发送信号给容器内所有进程（不仅仅是 init 进程）
 func (t *task) Kill(ctx context.Context, s syscall.Signal, opts ...KillOpts) error {
 	var i KillInfo
 	for _, o := range opts {
@@ -229,10 +257,10 @@ func (t *task) Kill(ctx context.Context, s syscall.Signal, opts ...KillOpts) err
 		}
 	}
 	_, err := t.client.TaskService().Kill(ctx, &tasks.KillRequest{
-		Signal:      uint32(s),
+		Signal:      uint32(s),     // wy: 如 syscall.SIGTERM(15), syscall.SIGKILL(9)
 		ContainerID: t.id,
-		ExecID:      i.ExecID,
-		All:         i.All,
+		ExecID:      i.ExecID,     // wy: 空="" 表示 init 进程，非空表示特定 exec 进程
+		All:         i.All,        // wy: true = 发送给容器内所有进程
 	})
 	if err != nil {
 		return errdefs.FromGRPC(err)
@@ -331,10 +359,18 @@ func (t *task) Delete(ctx context.Context, opts ...ProcessDeleteOpts) (*ExitStat
 	return &ExitStatus{code: r.ExitStatus, exitedAt: r.ExitedAt}, nil
 }
 
+// Exec 在运行中的容器内创建新进程（类似 docker exec）
+// wy: 🚀 调用链: Client → gRPC → Daemon → TTRPC → Shim → runc exec --process <spec.json>
+// 两步操作:
+//   1. task.Exec() 创建 exec 进程（runc exec 准备阶段），返回 Process 对象
+//   2. process.Start() 启动 exec 进程（解除阻塞）
+//
+// spec 参数是 OCI Process Spec，包含: args, env, cwd, capabilities, user 等
 func (t *task) Exec(ctx context.Context, id string, spec *specs.Process, ioCreate cio.Creator) (_ Process, err error) {
 	if id == "" {
 		return nil, errors.Wrapf(errdefs.ErrInvalidArgument, "exec id must not be empty")
 	}
+	// wy: 为 exec 进程创建独立的 IO 管道（与 init 进程的 IO 隔离）
 	i, err := ioCreate(id)
 	if err != nil {
 		return nil, err
@@ -345,20 +381,25 @@ func (t *task) Exec(ctx context.Context, id string, spec *specs.Process, ioCreat
 			i.Close()
 		}
 	}()
+
+	// wy: 🚀 将 OCI Process Spec 序列化为 protobuf Any
+	// 这是跨 gRPC 边界传递复杂对象的标准方式
 	any, err := typeurl.MarshalAny(spec)
 	if err != nil {
 		return nil, err
 	}
+
 	cfg := i.Config()
 	request := &tasks.ExecProcessRequest{
 		ContainerID: t.id,
-		ExecID:      id,
+		ExecID:      id,        // wy: exec 进程的唯一标识（如 "exec-1"）
 		Terminal:    cfg.Terminal,
-		Stdin:       cfg.Stdin,
+		Stdin:       cfg.Stdin, // wy: exec 进程专用的 FIFO 路径
 		Stdout:      cfg.Stdout,
 		Stderr:      cfg.Stderr,
-		Spec:        any,
+		Spec:        any,       // wy: OCI Process Spec (protobuf Any 编码)
 	}
+	// wy: gRPC 调用: 在 shim 中创建 exec 进程（但不启动）
 	if _, err := t.client.TaskService().Exec(ctx, request); err != nil {
 		i.Cancel()
 		i.Wait()

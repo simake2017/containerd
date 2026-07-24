@@ -60,7 +60,12 @@ func init() {
 	}
 }
 
-// App returns a *cli.App instance.
+// App 创建 containerd 的 CLI 应用
+// wy: containerd daemon 的启动入口，通过 urfave/cli 框架实现
+// 默认 action 是启动 daemon（前台运行），子命令包括:
+//   - config: 生成/查看默认配置
+//   - publish: 发布事件（被 shim 调用）
+//   - oci-hook: OCI 运行时 hook 支持
 func App() *cli.App {
 	app := cli.NewApp()
 	app.Name = "containerd"
@@ -81,7 +86,7 @@ can be used and modified as necessary as a custom configuration.`
 		cli.StringFlag{
 			Name:  "config,c",
 			Usage: "path to the configuration file",
-			Value: filepath.Join(defaults.DefaultConfigDir, "config.toml"),
+			Value: filepath.Join(defaults.DefaultConfigDir, "config.toml"), // wangyang 这里会有一个默认的配置文件
 		},
 		cli.StringFlag{
 			Name:  "log-level,l",
@@ -106,17 +111,19 @@ can be used and modified as necessary as a custom configuration.`
 		publishCommand,
 		ociHook,
 	}
+	// wy: 🚀 默认 Action: 启动 containerd daemon（前台运行）
 	app.Action = func(context *cli.Context) error {
 		var (
 			start   = time.Now()
-			signals = make(chan os.Signal, 2048)
+			signals = make(chan os.Signal, 2048) // wy: 大容量信号缓冲，防止信号丢失
 			serverC = make(chan *server.Server, 1)
 			ctx     = gocontext.Background()
 			config  = defaultConfig()
 		)
 
-		// Only try to load the config if it either exists, or the user explicitly
-		// told us to load this path.
+		// wy: Step 1: 加载 TOML 配置文件
+		// 默认路径: /etc/containerd/config.toml
+		// 配置文件控制: gRPC 地址、插件启用/禁用、各插件的详细参数
 		configPath := context.GlobalString("config")
 		_, err := os.Stat(configPath)
 		if !os.IsNotExist(err) || context.GlobalIsSet("config") {
@@ -125,12 +132,14 @@ can be used and modified as necessary as a custom configuration.`
 			}
 		}
 
-		// Apply flags to the config
+		// wy: Step 2: 命令行 flag 覆盖配置文件中的值（flag 优先级更高）
 		if err := applyFlags(context, config); err != nil {
 			return err
 		}
 
-		// Make sure top-level directories are created early.
+		// wy: Step 3: 创建顶层目录
+		//   Root:  /var/lib/containerd  (持久化: content blobs, meta.db, snapshots)
+		//   State: /run/containerd      (运行时: shim socket, bundle, 临时挂载)
 		if err := server.CreateTopLevelDirectories(config); err != nil {
 			return err
 		}
@@ -144,16 +153,17 @@ can be used and modified as necessary as a custom configuration.`
 			return nil
 		}
 
+		// wy: Step 4: 启动信号处理器（尽早启动，确保不丢失 boot 过程中的信号）
+		// SIGTERM/SIGINT → 优雅退出
+		// SIGUSR1 → 打印所有 goroutine 栈（调试用）
 		done := handleSignals(ctx, signals, serverC)
-		// start the signal handler as soon as we can to make sure that
-		// we don't miss any signals during boot
 		signal.Notify(signals, handledSignals...)
 
-		// cleanup temp mounts
+		// wy: Step 5: 清理上次异常退出遗留的临时挂载点
+		// 场景: daemon 崩溃时，overlayfs 的临时挂载可能未被卸载
 		if err := mount.SetTempMountLocation(filepath.Join(config.Root, "tmpmounts")); err != nil {
 			return errors.Wrap(err, "creating temp mount location")
 		}
-		// unmount all temp mounts on boot for the server
 		warnings, err := mount.CleanupTempMounts(0)
 		if err != nil {
 			log.G(ctx).WithError(err).Error("unmounting temp mounts")
@@ -162,11 +172,13 @@ can be used and modified as necessary as a custom configuration.`
 			log.G(ctx).WithError(w).Warn("cleanup temp mount")
 		}
 
+		// wy: Step 6: 验证并补全监听地址
 		if config.GRPC.Address == "" {
 			return errors.Wrap(errdefs.ErrInvalidArgument, "grpc address cannot be empty")
 		}
 		if config.TTRPC.Address == "" {
-			// If TTRPC was not explicitly configured, use defaults based on GRPC.
+			// wy: TTRPC 地址默认基于 gRPC 地址生成（加 .ttrpc 后缀）
+			// 例如: /run/containerd/containerd.sock → /run/containerd/containerd.sock.ttrpc
 			config.TTRPC.Address = fmt.Sprintf("%s.ttrpc", config.GRPC.Address)
 			config.TTRPC.UID = config.GRPC.UID
 			config.TTRPC.GID = config.GRPC.GID
@@ -176,6 +188,7 @@ can be used and modified as necessary as a custom configuration.`
 			"revision": version.Revision,
 		}).Info("starting containerd")
 
+		// wy: Step 7: 🚀 创建 Server 实例（核心！内部加载并初始化所有 Plugin）
 		server, err := server.New(ctx, config)
 		if err != nil {
 			return err
@@ -188,6 +201,11 @@ can be used and modified as necessary as a custom configuration.`
 
 		serverC <- server
 
+		// wy: Step 8: 启动各种监听端口
+		// 每个 serve() 都在独立的 goroutine 中运行
+
+		// wy: 8a. Debug Server（pprof + expvar）
+		// 提供性能分析和运行时变量查看: /debug/pprof/, /debug/vars
 		if config.Debug.Address != "" {
 			var l net.Listener
 			if isLocalAddress(config.Debug.Address) {
@@ -201,6 +219,8 @@ can be used and modified as necessary as a custom configuration.`
 			}
 			serve(ctx, l, server.ServeDebug)
 		}
+
+		// wy: 8b. Metrics Server（Prometheus 指标端点）
 		if config.Metrics.Address != "" {
 			l, err := net.Listen("tcp", config.Metrics.Address)
 			if err != nil {
@@ -208,13 +228,17 @@ can be used and modified as necessary as a custom configuration.`
 			}
 			serve(ctx, l, server.ServeMetrics)
 		}
-		// setup the ttrpc endpoint
+
+		// wy: 8c. 🚀 TTRPC Server（给 Shim 进程用的轻量 RPC 端点）
+		// 默认地址: /run/containerd/containerd.sock.ttrpc
+		// Shim 进程通过此端口向 Daemon 发布事件
 		tl, err := sys.GetLocalListener(config.TTRPC.Address, config.TTRPC.UID, config.TTRPC.GID)
 		if err != nil {
 			return errors.Wrapf(err, "failed to get listener for main ttrpc endpoint")
 		}
 		serve(ctx, tl, server.ServeTTRPC)
 
+		// wy: 8d. TCP gRPC Server（可选的远程访问端点，需配置 TLS）
 		if config.GRPC.TCPAddress != "" {
 			l, err := net.Listen("tcp", config.GRPC.TCPAddress)
 			if err != nil {
@@ -222,19 +246,23 @@ can be used and modified as necessary as a custom configuration.`
 			}
 			serve(ctx, l, server.ServeTCP)
 		}
-		// setup the main grpc endpoint
+
+		// wy: 8e. 🚀 主 gRPC Server（Client 端连接的主要端点）
+		// 默认地址: /run/containerd/containerd.sock（Unix Domain Socket）
+		// ctr、Docker、Kubernetes kubelet 都通过此端口与 containerd 通信
 		l, err := sys.GetLocalListener(config.GRPC.Address, config.GRPC.UID, config.GRPC.GID)
 		if err != nil {
 			return errors.Wrapf(err, "failed to get listener for main endpoint")
 		}
 		serve(ctx, l, server.ServeGRPC)
 
+		// wy: 通知 systemd 等服务：daemon 已就绪
 		if err := notifyReady(ctx); err != nil {
 			log.G(ctx).WithError(err).Warn("notify ready failed")
 		}
 
 		log.G(ctx).Infof("containerd successfully booted in %fs", time.Since(start).Seconds())
-		<-done
+		<-done // wy: 阻塞等待退出信号（SIGTERM/SIGINT）
 		return nil
 	}
 	return app
@@ -243,7 +271,7 @@ can be used and modified as necessary as a custom configuration.`
 func serve(ctx gocontext.Context, l net.Listener, serveFunc func(net.Listener) error) {
 	path := l.Addr().String()
 	log.G(ctx).WithField("address", path).Info("serving...")
-	go func() {
+	go func() { // 单独在一个协程里面执行
 		defer l.Close()
 		if err := serveFunc(l); err != nil {
 			log.G(ctx).WithError(err).WithField("address", path).Fatal("serve failure")

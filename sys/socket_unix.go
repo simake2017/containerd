@@ -1,3 +1,4 @@
+//go:build !windows
 // +build !windows
 
 /*
@@ -49,12 +50,12 @@ func GetLocalListener(path string, uid, gid int) (net.Listener, error) {
 		return nil, err
 	}
 
-	l, err := CreateUnixSocket(path)
+	l, err := CreateUnixSocket(path) // wangyang 创建unix socket, 上层Listener 接口是一样的
 	if err != nil {
 		return l, err
 	}
 
-	if err := os.Chmod(path, 0660); err != nil {
+	if err := os.Chmod(path, 0660); err != nil { // 改变访问权限
 		l.Close()
 		return nil, err
 	}

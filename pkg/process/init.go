@@ -1,3 +1,4 @@
+//go:build !windows
 // +build !windows
 
 /*
@@ -142,7 +143,7 @@ func (p *Init) Create(ctx context.Context, r *CreateConfig) error {
 	if socket != nil {
 		opts.ConsoleSocket = socket
 	}
-	if err := p.runtime.Create(ctx, r.ID, r.Bundle, opts); err != nil {
+	if err := p.runtime.Create(ctx, r.ID, r.Bundle, opts); err != nil { //wangyang **这里会调用 runc 进行create
 		return p.runtimeError(err, "OCI runtime create failed")
 	}
 	if r.Stdin != "" {

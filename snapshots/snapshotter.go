@@ -35,15 +35,32 @@ const (
 	labelSnapshotRef      = "containerd.io/snapshot.ref"
 )
 
-// Kind identifies the kind of snapshot.
+// Kind 标识快照的类型
+// wy: 🚀 三种快照类型的含义:
+//
+//   KindActive: 可写快照——通过 Prepare() 创建
+//     用于: 容器的可写层（容器运行时的读写操作都在此层）
+//     特点: 不能作为 parent，必须先 Commit 为 Committed 后才能被引用
+//
+//   KindCommitted: 只读快照——通过 Commit() 创建
+//     用于: 镜像层（每个 image layer 对应一个 Committed 快照）
+//     特点: 可以作为 parent，被 Active 快照或 View 快照引用
+//
+//   KindView: 只读视图——通过 View() 创建
+//     用于: 挂载某个 Committed 快照进行只读访问（如查看镜像内容）
+//
+// 生命周期:
+//   镜像拉取: Prepare(active) → 解压 tar → Commit(committed)
+//   容器创建: Prepare(active, parent=最后一层 committed) → 容器可写层
+//   镜像查看: View(view, parent=committed) → 只读挂载
 type Kind uint8
 
 // definitions of snapshot kinds
 const (
 	KindUnknown Kind = iota
-	KindView
-	KindActive
-	KindCommitted
+	KindView       // wy: 只读视图
+	KindActive     // wy: 可写快照（容器的可写层）
+	KindCommitted  // wy: 只读快照（镜像层）
 )
 
 // ParseKind parses the provided string into a Kind
@@ -248,83 +265,63 @@ type WalkFunc func(context.Context, Info) error
 //
 // Alternatively, for most container runs, Snapshotter.Remove will be called to
 // signal the Snapshotter to abandon the changes.
+// Snapshotter 定义文件系统快照器的接口
+// wy: 🚀 这是 containerd 文件系统层叠管理的核心抽象
+// 默认实现: overlayfs（snapshots/overlay）
+// 其他实现: native（直接拷贝）、devmapper（块设备 thin-provisioning）、stargz（延迟加载）
+//
+// 快照的生命周期:
+//   镜像拉取时:
+//     Prepare(active, parent="") → tar 解压 → Commit(committed, "sha256-xxx")
+//     Prepare(active, parent=layer1) → tar 解压 → Commit(committed, "sha256-yyy")
+//     ... 逐层构建
+//
+//   容器创建时:
+//     Prepare(active, parent=最后一层committed) → 返回 overlay mounts → 作为容器可写层
+//
+//   容器删除时:
+//     Remove(active key) → 删除 upperdir + workdir
+//
+// overlayfs 实现细节:
+//   每个 Committed 快照 = 一个只读目录（lowerdir 的一层）
+//   每个 Active 快照 = upperdir + workdir（可写层）
+//   Mounts() 返回的 overlay mount 将所有层合并为统一视图:
+//     mount -t overlay overlay -o lowerdir=L3:L2:L1,upperdir=U,workdir=W /rootfs
 type Snapshotter interface {
-	// Stat returns the info for an active or committed snapshot by name or
-	// key.
-	//
-	// Should be used for parent resolution, existence checks and to discern
-	// the kind of snapshot.
+	// Stat 查询快照信息
 	Stat(ctx context.Context, key string) (Info, error)
 
-	// Update updates the info for a snapshot.
-	//
-	// Only mutable properties of a snapshot may be updated.
+	// Update 更新快照的可变属性（如 labels）
 	Update(ctx context.Context, info Info, fieldpaths ...string) (Info, error)
 
-	// Usage returns the resource usage of an active or committed snapshot
-	// excluding the usage of parent snapshots.
-	//
-	// The running time of this call for active snapshots is dependent on
-	// implementation, but may be proportional to the size of the resource.
-	// Callers should take this into consideration. Implementations should
-	// attempt to honer context cancellation and avoid taking locks when making
-	// the calculation.
+	// Usage 返回快照的磁盘使用量（不包含 parent 的使用量）
 	Usage(ctx context.Context, key string) (Usage, error)
 
-	// Mounts returns the mounts for the active snapshot transaction identified
-	// by key. Can be called on an read-write or readonly transaction. This is
-	// available only for active snapshots.
-	//
-	// This can be used to recover mounts after calling View or Prepare.
+	// Mounts 返回 Active 快照的挂载参数
+	// wy: 🚀 关键方法——返回的 mount.Mount 可直接传给 mount.All() 执行挂载
+	// overlayfs 返回: {Type: "overlay", Source: "overlay", Options: ["lowerdir=...", "upperdir=...", "workdir=..."]}
 	Mounts(ctx context.Context, key string) ([]mount.Mount, error)
 
-	// Prepare creates an active snapshot identified by key descending from the
-	// provided parent.  The returned mounts can be used to mount the snapshot
-	// to capture changes.
-	//
-	// If a parent is provided, after performing the mounts, the destination
-	// will start with the content of the parent. The parent must be a
-	// committed snapshot. Changes to the mounted destination will be captured
-	// in relation to the parent. The default parent, "", is an empty
-	// directory.
-	//
-	// The changes may be saved to a committed snapshot by calling Commit. When
-	// one is done with the transaction, Remove should be called on the key.
-	//
-	// Multiple calls to Prepare or View with the same key should fail.
+	// Prepare 创建 Active 快照（可写层）
+	// wy: 🚀 最常用的方法:
+	//   - 镜像拉取时: Prepare("extract-xxx", parentLayer) → 准备解压目标
+	//   - 容器创建时: Prepare("container-key", imageTopLayer) → 创建容器可写层
+	// 返回的 mounts 用于将快照挂载到临时目录进行操作
 	Prepare(ctx context.Context, key, parent string, opts ...Opt) ([]mount.Mount, error)
 
-	// View behaves identically to Prepare except the result may not be
-	// committed back to the snapshot snapshotter. View returns a readonly view on
-	// the parent, with the active snapshot being tracked by the given key.
-	//
-	// This method operates identically to Prepare, except that Mounts returned
-	// may have the readonly flag set. Any modifications to the underlying
-	// filesystem will be ignored. Implementations may perform this in a more
-	// efficient manner that differs from what would be attempted with
-	// `Prepare`.
-	//
-	// Commit may not be called on the provided key and will return an error.
-	// To collect the resources associated with key, Remove must be called with
-	// key as the argument.
+	// View 创建只读视图（类似 Prepare 但不可写、不可 Commit）
 	View(ctx context.Context, key, parent string, opts ...Opt) ([]mount.Mount, error)
 
-	// Commit captures the changes between key and its parent into a snapshot
-	// identified by name.  The name can then be used with the snapshotter's other
-	// methods to create subsequent snapshots.
-	//
-	// A committed snapshot will be created under name with the parent of the
-	// active snapshot.
-	//
-	// After commit, the snapshot identified by key is removed.
+	// Commit 将 Active 快照提交为 Committed 快照
+	// wy: 🚀 镜像拉取时的关键步骤:
+	//   1. Prepare("extract-1", "") → 解压 layer1.tar
+	//   2. Commit("sha256-layer1", "extract-1") → 将解压结果标记为只读层
+	//   3. Prepare("extract-2", "sha256-layer1") → 基于第 1 层准备第 2 层
+	//   4. Commit("sha256-layer2", "extract-2") → 提交第 2 层
 	Commit(ctx context.Context, name, key string, opts ...Opt) error
 
-	// Remove the committed or active snapshot by the provided key.
-	//
-	// All resources associated with the key will be removed.
-	//
-	// If the snapshot is a parent of another snapshot, its children must be
-	// removed before proceeding.
+	// Remove 删除快照
+	// wy: 容器删除时调用，清理 upperdir/workdir
 	Remove(ctx context.Context, key string) error
 
 	// Walk will call the provided function for each snapshot in the

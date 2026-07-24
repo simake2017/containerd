@@ -1,3 +1,4 @@
+//go:build linux && !no_btrfs && cgo
 // +build linux,!no_btrfs,cgo
 
 /*
@@ -47,7 +48,7 @@ func init() {
 				return nil, errors.New("invalid btrfs configuration")
 			}
 
-			root := ic.Root
+			root := ic.Root // 会在创建的时候指定对应的Root 目录
 			if len(config.RootPath) != 0 {
 				root = config.RootPath
 			}

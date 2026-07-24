@@ -41,10 +41,10 @@ func init() {
 		Type: plugin.ServicePlugin,
 		ID:   services.ContainersService,
 		Requires: []plugin.Type{
-			plugin.MetadataPlugin,
+			plugin.MetadataPlugin, // 这里依赖的 MetadataPlugin 在main 启动时候注册
 		},
 		InitFn: func(ic *plugin.InitContext) (interface{}, error) {
-			m, err := ic.Get(plugin.MetadataPlugin)
+			m, err := ic.Get(plugin.MetadataPlugin) //
 			if err != nil {
 				return nil, err
 			}

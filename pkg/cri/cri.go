@@ -87,7 +87,7 @@ func initCRIService(ic *plugin.InitContext) (interface{}, error) {
 	}
 
 	log.G(ctx).Info("Connect containerd service")
-	client, err := containerd.New(
+	client, err := containerd.New( // wangyang ** 这里是创建了一个containerd 的client
 		"",
 		containerd.WithDefaultNamespace(constants.K8sContainerdNamespace),
 		containerd.WithDefaultPlatform(platforms.Default()),

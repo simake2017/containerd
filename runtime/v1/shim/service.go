@@ -1,3 +1,4 @@
+//go:build !windows
 // +build !windows
 
 /*
@@ -189,7 +190,7 @@ func (s *Service) Create(ctx context.Context, r *shimapi.CreateTaskRequest) (_ *
 	s.id = r.ID
 	s.bundle = r.Bundle
 	pid := process.Pid()
-	s.processes[r.ID] = process
+	s.processes[r.ID] = process // wangyang 这里就是对应的那个进程
 	return &shimapi.CreateTaskResponse{
 		Pid: uint32(pid),
 	}, nil

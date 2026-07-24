@@ -143,8 +143,8 @@ var Command = cli.Command{
 				return errors.New("with spec config file, only container id should be provided")
 			}
 		} else {
-			id = context.Args().Get(1)
-			ref = context.Args().First()
+			id = context.Args().Get(1)   // 0 是镜像名称 1 是 镜像ID
+			ref = context.Args().First() // 这里是镜像名称
 
 			if ref == "" {
 				return errors.New("image ref must be provided")
@@ -153,7 +153,7 @@ var Command = cli.Command{
 		if id == "" {
 			return errors.New("container id must be provided")
 		}
-		client, ctx, cancel, err := commands.NewClient(context)
+		client, ctx, cancel, err := commands.NewClient(context) // wangyang 创建相应client
 		if err != nil {
 			return err
 		}
@@ -212,7 +212,7 @@ var Command = cli.Command{
 				return err
 			}
 		}
-		if err := task.Start(ctx); err != nil {
+		if err := task.Start(ctx); err != nil { // wangyang 任务启动
 			return err
 		}
 		if detach {

@@ -33,14 +33,14 @@ func init() {
 		Type: plugin.GRPCPlugin,
 		ID:   "containers",
 		Requires: []plugin.Type{
-			plugin.ServicePlugin,
+			plugin.ServicePlugin, // 插件依赖关系
 		},
 		InitFn: func(ic *plugin.InitContext) (interface{}, error) {
 			plugins, err := ic.GetByType(plugin.ServicePlugin)
 			if err != nil {
 				return nil, err
 			}
-			p, ok := plugins[services.ContainersService]
+			p, ok := plugins[services.ContainersService] //wangyang** 这里会找到同目录下的 local 文件
 			if !ok {
 				return nil, errors.New("containers service not found")
 			}

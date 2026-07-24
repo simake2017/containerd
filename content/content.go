@@ -25,24 +25,31 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
-// ReaderAt extends the standard io.ReaderAt interface with reporting of Size and io.Closer
+// ReaderAt 扩展了标准 io.ReaderAt，增加了 Size 和 Close
+// wy: Content Store 的读接口——支持随机读取 blob 的任意偏移
 type ReaderAt interface {
 	io.ReaderAt
 	io.Closer
 	Size() int64
 }
 
-// Provider provides a reader interface for specific content
+// Provider 提供内容读取能力
+// wy: 🚀 Content Store 的读侧接口
+// 通过 OCI Descriptor（包含 digest + size）定位并读取 blob
+// 默认实现: content/local.Store（从本地文件系统读取）
 type Provider interface {
-	// ReaderAt only requires desc.Digest to be set.
-	// Other fields in the descriptor may be used internally for resolving
-	// the location of the actual data.
+	// ReaderAt 通过 digest 获取 blob 的随机读取器
+	// 底层实现: 打开 /var/lib/containerd/.../blobs/sha256/<hex> 文件
 	ReaderAt(ctx context.Context, desc ocispec.Descriptor) (ReaderAt, error)
 }
 
-// Ingester writes content
+// Ingester 提供内容写入能力
+// wy: 🚀 Content Store 的写侧接口
+// 写入流程: Writer() 获取 writer → Write(data) → Commit(digest)
+// 默认实现: content/local.Store
 type Ingester interface {
-	// Some implementations require WithRef to be included in opts.
+	// Writer 创建一个写入器
+	// WithRef 指定写入引用名（用于跟踪写入进度和断点续传）
 	Writer(ctx context.Context, opts ...WriterOpt) (Writer, error)
 }
 
@@ -131,13 +138,27 @@ type Writer interface {
 	Truncate(size int64) error
 }
 
-// Store combines the methods of content-oriented interfaces into a set that
-// are commonly provided by complete implementations.
+// Store 是内容存储的完整接口——组合了读、写、管理、 ingest 四大能力
+// wy: 🚀 这是 containerd 的 CAS（Content Addressable Storage）核心接口
+// 默认实现: content/local.Store
+//
+// 存储结构（文件系统布局）:
+//   /var/lib/containerd/io.containerd.content.v1.content/
+//     ├── blobs/
+//     │   └── sha256/
+//     │       ├── <hex-digest-1>  ← 镜像 layer tar.gz
+//     │       ├── <hex-digest-2>  ← image config JSON
+//     │       └── <hex-digest-3>  ← manifest JSON
+//     └── ingest/
+//         └── <ref>/              ← 进行中的写入（commit 后移动到 blobs/）
+//
+// 所有 blob 以 digest 为文件名，天然去重：
+// 同一个 layer 被多个镜像引用时，磁盘上只存一份
 type Store interface {
-	Manager
-	Provider
-	IngestManager
-	Ingester
+	Manager      // wy: Info/Update/Walk/Delete（管理已有内容）
+	Provider     // wy: ReaderAt（读取内容）
+	IngestManager // wy: Status/ListStatuses/Abort（管理进行中的写入）
+	Ingester     // wy: Writer（开始新写入）
 }
 
 // Opt is used to alter the mutable properties of content

@@ -66,6 +66,15 @@ const (
 )
 
 func init() {
+	// wy: 🚀 注册 Task Service Plugin
+	// 这是 daemon 侧的 Task 服务实现——它接收 gRPC 请求，
+	// 委托给 Runtime V2 TaskManager（通过 TTRPC 与 shim 通信）
+	//
+	// 职责:
+	//   - Create: 从 BoltDB 获取容器信息 → 准备 rootfs mounts → 调用 runtime.Create
+	//   - Start/Kill/Delete/Exec: 获取 task → 委托给 runtime
+	//   - Wait: 监听 task 退出事件
+	//   - Checkpoint: 创建容器检查点
 	plugin.Register(&plugin.Registration{
 		Type:     plugin.ServicePlugin,
 		ID:       services.TasksService,
@@ -73,6 +82,7 @@ func init() {
 		InitFn:   initFunc,
 	})
 
+	// wy: 查询 task 状态的默认超时（2 秒）
 	timeout.Set(stateTimeout, 2*time.Second)
 }
 
@@ -128,17 +138,37 @@ func initFunc(ic *plugin.InitContext) (interface{}, error) {
 	return l, nil
 }
 
+// local 是 Task Service 的 daemon 侧实现
+// wy: 🚀 它是 gRPC TaskService 的直接处理者
+// 每个 gRPC 方法（Create/Start/Kill 等）都有一个对应的 local 方法
+//
+// 调用链: Client gRPC → local.Create() → v2Runtime.Create() → TTRPC → shim → runc
+//
+// 关键依赖:
+//   - v2Runtime: v2 TaskManager（管理 shim 进程）
+//   - containers: BoltDB 容器存储（获取容器元数据）
+//   - store: Content Store（获取 checkpoint 数据）
+//   - publisher: 事件发布器（发布 TaskCreate/TaskStart/TaskExit 等事件）
+//   - monitor: Task 监控器（监控 task 状态变化）
 type local struct {
-	runtimes   map[string]runtime.PlatformRuntime
-	containers containers.Store
-	store      content.Store
-	publisher  events.Publisher
+	runtimes   map[string]runtime.PlatformRuntime // wy: v1 runtime 映射（按 runtime 名称索引）
+	containers containers.Store                   // wy: 容器元数据存储（BoltDB）
+	store      content.Store                      // wy: 内容存储（checkpoint 恢复用）
+	publisher  events.Publisher                   // wy: 事件发布器
 
-	monitor   runtime.TaskMonitor
-	v2Runtime *v2.TaskManager
+	monitor   runtime.TaskMonitor // wy: Task 监控器（监控 task 退出等状态变化）
+	v2Runtime *v2.TaskManager     // wy: 🚀 v2 TaskManager——所有 shim 管理的入口
 }
 
+// Create 处理 Task 创建的 gRPC 请求
+// wy: 🚀 完整的创建流程（daemon 侧）:
+//   1. 从 BoltDB 获取容器元数据（Image, Spec, SnapshotKey, Runtime）
+//   2. 处理 checkpoint 恢复（如果有）
+//   3. 构建 runtime.CreateOpts（Spec + Rootfs mounts + IO 配置）
+//   4. 调用 v2Runtime.Create() → TaskManager → startShim → shim.Create → runc create
+//   5. 将 task 注册到 monitor（监控状态变化）
 func (l *local) Create(ctx context.Context, r *api.CreateTaskRequest, _ ...grpc.CallOption) (*api.CreateTaskResponse, error) {
+	// wy: Step 1: 从 BoltDB 获取容器元数据
 	container, err := l.getContainer(ctx, r.ContainerID)
 	if err != nil {
 		return nil, errdefs.ToGRPC(err)
@@ -171,24 +201,26 @@ func (l *local) Create(ctx context.Context, r *api.CreateTaskRequest, _ ...grpc.
 			return nil, err
 		}
 	}
+	// wy: Step 2: 构建 runtime 创建选项
 	opts := runtime.CreateOpts{
-		Spec: container.Spec,
+		Spec: container.Spec, // wy: OCI runtime spec（config.json 的内容，protobuf Any 编码）
 		IO: runtime.IO{
-			Stdin:    r.Stdin,
+			Stdin:    r.Stdin,   // wy: FIFO 路径，会传递给 shim
 			Stdout:   r.Stdout,
 			Stderr:   r.Stderr,
 			Terminal: r.Terminal,
 		},
 		Checkpoint:     checkpointPath,
-		Runtime:        container.Runtime.Name,
-		RuntimeOptions: container.Runtime.Options,
+		Runtime:        container.Runtime.Name,    // wy: 如 "io.containerd.runc.v2"
+		RuntimeOptions: container.Runtime.Options, // wy: runtime 配置（如 SystemdCgroup）
 		TaskOptions:    r.Options,
 	}
+	// wy: 添加 rootfs 挂载信息（来自 Client 端 NewTask 中从 Snapshotter 获取的 mounts）
 	for _, m := range r.Rootfs {
 		opts.Rootfs = append(opts.Rootfs, mount.Mount{
-			Type:    m.Type,
+			Type:    m.Type,    // wy: 如 "overlay"
 			Source:  m.Source,
-			Options: m.Options,
+			Options: m.Options, // wy: 如 ["workdir=...", "upperdir=...", "lowerdir=..."]
 		})
 	}
 	if strings.HasPrefix(container.Runtime.Name, "io.containerd.runtime.v1.") {
@@ -196,10 +228,14 @@ func (l *local) Create(ctx context.Context, r *api.CreateTaskRequest, _ ...grpc.
 	} else if container.Runtime.Name == plugin.RuntimeRuncV1 {
 		log.G(ctx).Warnf("%q is deprecated since containerd v1.4, consider using %q", plugin.RuntimeRuncV1, plugin.RuntimeRuncV2)
 	}
+
+	// wy: Step 3: 获取对应的 runtime（v2 TaskManager）
 	rtime, err := l.getRuntime(container.Runtime.Name)
 	if err != nil {
 		return nil, err
 	}
+
+	// wy: 检查 task 是否已存在（防止重复创建）
 	_, err = rtime.Get(ctx, r.ContainerID)
 	if err != nil && err != runtime.ErrTaskNotExists {
 		return nil, errdefs.ToGRPC(err)
@@ -207,17 +243,21 @@ func (l *local) Create(ctx context.Context, r *api.CreateTaskRequest, _ ...grpc.
 	if err == nil {
 		return nil, errdefs.ToGRPC(fmt.Errorf("task %s already exists", r.ContainerID))
 	}
+
+	// wy: Step 4: 🚀 调用 runtime.Create → TaskManager.Create → startShim → runc create
 	c, err := rtime.Create(ctx, r.ContainerID, opts)
 	if err != nil {
 		return nil, errdefs.ToGRPC(err)
 	}
+
+	// wy: Step 5: 将 task 注册到 monitor（监控退出事件等）
 	labels := map[string]string{"runtime": container.Runtime.Name}
 	if err := l.monitor.Monitor(c, labels); err != nil {
 		return nil, errors.Wrap(err, "monitor task")
 	}
 	return &api.CreateTaskResponse{
 		ContainerID: r.ContainerID,
-		Pid:         c.PID(),
+		Pid:         c.PID(), // wy: 返回容器 init 进程的 PID
 	}, nil
 }
 

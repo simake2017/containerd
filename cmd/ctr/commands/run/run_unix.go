@@ -135,6 +135,7 @@ func NewContainer(ctx gocontext.Context, client *containerd.Client, context *cli
 				image = containerd.NewImage(client, i)
 			}
 
+
 			unpacked, err := image.IsUnpacked(ctx, snapshotter)
 			if err != nil {
 				return nil, err

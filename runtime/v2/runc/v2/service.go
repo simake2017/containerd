@@ -57,28 +57,43 @@ import (
 )
 
 var (
+	// wy: 编译期接口实现检查——确保 service 实现了 taskAPI.TaskService
 	_     = (taskAPI.TaskService)(&service{})
 	empty = &ptypes.Empty{}
 )
 
-// group labels specifies how the shim groups services.
-// currently supports a runc.v2 specific .group label and the
-// standard k8s pod label.  Order matters in this list
+// groupLabels 定义 shim 进程分组的 label 键
+// wy: 🚀 Kubernetes Pod 场景的关键机制:
+// 同一个 Pod 内的多个容器可以共享一个 shim 进程（减少资源开销）
+// 通过 annotation "io.kubernetes.cri.sandbox-id" 标识属于同一个 Pod 的容器
+// 第一个容器启动 shim，后续容器复用同一个 shim（通过 socket 地址判断）
 var groupLabels = []string{
-	"io.containerd.runc.v2.group",
-	"io.kubernetes.cri.sandbox-id",
+	"io.containerd.runc.v2.group",      // wy: runc.v2 自定义分组
+	"io.kubernetes.cri.sandbox-id",     // wy: K8s Pod sandbox ID（生产最常用）
 }
 
 type spec struct {
 	Annotations map[string]string `json:"annotations,omitempty"`
 }
 
-// New returns a new shim service that can be used via GRPC
+// New 创建 shim service 实例（在 shim 进程内部调用）
+// wy: 🚀 这是 containerd-shim-runc-v2 进程内部的核心 service
+// 它运行在独立的 shim 进程中，通过 TTRPC 接收 daemon 的指令
+// 每个 shim 进程可以管理多个容器（通过 groupLabels 分组）
+//
+// 初始化时做了 4 件关键事:
+//   1. OOM Watcher: 监控容器的 cgroup OOM 事件
+//   2. Process Reaper: 订阅子进程退出事件（reaper.Default）
+//   3. Platform: 初始化终端/控制台处理（Linux PTY）
+//   4. Event Forwarder: 将 shim 内的事件转发给 daemon
 func New(ctx context.Context, id string, publisher shim.Publisher, shutdown func()) (shim.Shim, error) {
 	var (
 		ep  oom.Watcher
 		err error
 	)
+	// wy: 根据 cgroup 版本创建 OOM 监控器
+	// cgroups v1: 监听 memory.oom_control 的 eventfd
+	// cgroups v2: 监听 memory.events 中的 oom 计数变化
 	if cgroups.Mode() == cgroups.Unified {
 		ep, err = oomv2.New(publisher)
 	} else {
@@ -87,23 +102,24 @@ func New(ctx context.Context, id string, publisher shim.Publisher, shutdown func
 	if err != nil {
 		return nil, err
 	}
-	go ep.Run(ctx)
+	go ep.Run(ctx) // wy: 后台运行 OOM 监控循环
+
 	s := &service{
 		id:         id,
 		context:    ctx,
-		events:     make(chan interface{}, 128),
-		ec:         reaper.Default.Subscribe(),
+		events:     make(chan interface{}, 128),     // wy: 事件缓冲队列
+		ec:         reaper.Default.Subscribe(),      // wy: 🚀 订阅子进程退出通知
 		ep:         ep,
 		cancel:     shutdown,
-		containers: make(map[string]*runc.Container),
+		containers: make(map[string]*runc.Container), // wy: 此 shim 管理的所有容器
 	}
-	go s.processExits()
-	runcC.Monitor = reaper.Default
+	go s.processExits()         // wy: 后台处理容器退出事件
+	runcC.Monitor = reaper.Default // wy: 🚀 设置 go-runc 库的进程监控器为全局 reaper
 	if err := s.initPlatform(); err != nil {
 		shutdown()
 		return nil, errors.Wrap(err, "failed to initialized platform behavior")
 	}
-	go s.forward(ctx, publisher)
+	go s.forward(ctx, publisher) // wy: 后台将事件转发到 daemon（通过 TTRPC publish）
 
 	if address, err := shim.ReadAddress("address"); err == nil {
 		s.shimAddress = address
@@ -111,24 +127,33 @@ func New(ctx context.Context, id string, publisher shim.Publisher, shutdown func
 	return s, nil
 }
 
-// service is the shim implementation of a remote shim over GRPC
+// service 是 shim 进程中的 TaskService 实现
+// wy: 🚀 这是整个容器运行时架构的最底层——直接与 runc 交互
+// 它通过 TTRPC 接收 daemon 的 Create/Start/Kill/Delete/Exec 等指令，
+// 转化为对 runc CLI 的调用（通过 go-runc 库 fork/exec runc 二进制）
+//
+// 关键组件:
+//   containers: map[string]*runc.Container — 此 shim 管理的所有容器
+//   ec: 子进程退出 channel — 由 reaper 在 wait4() 收集到僵尸进程后发送
+//   ep: OOM watcher — 监控 cgroup OOM 事件
+//   events: 事件队列 — 缓存待发送的事件（TaskCreate/TaskStart/TaskExit 等）
 type service struct {
 	mu          sync.Mutex
 	eventSendMu sync.Mutex
 
 	context  context.Context
-	events   chan interface{}
-	platform stdio.Platform
-	ec       chan runcC.Exit
-	ep       oom.Watcher
+	events   chan interface{}       // wy: 事件缓冲队列（容量 128）
+	platform stdio.Platform         // wy: 平台相关的 IO 处理（Linux: PTY/console）
+	ec       chan runcC.Exit        // wy: 子进程退出通知（reaper 发出）
+	ep       oom.Watcher            // wy: OOM 事件监控器
 
 	// id only used in cleanup case
 	id string
 
-	containers map[string]*runc.Container
+	containers map[string]*runc.Container // wy: 容器 ID → 容器对象（含 init 进程和 exec 进程）
 
-	shimAddress string
-	cancel      func()
+	shimAddress string // wy: 此 shim 的 TTRPC socket 地址
+	cancel      func() // wy: 关闭 shim 的回调函数
 }
 
 func newCommand(ctx context.Context, id, containerdBinary, containerdAddress, containerdTTRPCAddress string) (*exec.Cmd, error) {
@@ -324,18 +349,30 @@ func (s *service) Cleanup(ctx context.Context) (*taskAPI.DeleteResponse, error) 
 	}, nil
 }
 
-// Create a new initial process and container with the underlying OCI runtime
+// Create 创建一个新的容器（shim 内部实现）
+// wy: 🚀 这是容器创建的最底层实现——在 shim 进程中执行
+// 调用链: Daemon TTRPC → shim.Create() → runc.NewContainer() → runc create
+//
+// runc.NewContainer 内部会:
+//   1. 挂载 rootfs（根据 request 中的 mount info 执行 mount 系统调用）
+//   2. 调用 runc create --bundle <bundle-path> <container-id>
+//      → runc 解析 config.json，设置 namespaces/cgroups/seccomp/mounts
+//      → fork init 进程，但 init 进程在 execve 用户命令之前阻塞（等待 start）
+//   3. 设置 IO 管道（FIFO 或 PTY）
 func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *taskAPI.CreateTaskResponse, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// wy: 🚀 核心: 创建 runc 容器对象并调用 runc create
 	container, err := runc.NewContainer(ctx, s.platform, r)
 	if err != nil {
 		return nil, err
 	}
 
+	// wy: 将容器加入此 shim 的管理列表
 	s.containers[r.ID] = container
 
+	// wy: 🚀 发布 TaskCreate 事件（通过事件队列 → forward goroutine → daemon）
 	s.send(&eventstypes.TaskCreate{
 		ContainerID: r.ID,
 		Bundle:      r.Bundle,
@@ -347,7 +384,7 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *
 			Terminal: r.Terminal,
 		},
 		Checkpoint: r.Checkpoint,
-		Pid:        uint32(container.Pid()),
+		Pid:        uint32(container.Pid()), // wy: 容器 init 进程 PID
 	})
 
 	return &taskAPI.CreateTaskResponse{
@@ -355,15 +392,25 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *
 	}, nil
 }
 
-// Start a process
+// Start 启动容器的 init 进程或 exec 进程
+// wy: 🚀 核心底层交互:
+//   - ExecID="" → 启动 init 进程: runc start <id>
+//     init 进程解除阻塞，开始执行 config.json 中定义的命令
+//   - ExecID!="" → 启动 exec 进程: runc exec --process <spec.json>
+//     在已运行的容器的 namespaces 中 fork 新进程
+//
+// Start 后还会:
+//   1. 将容器的 cgroup 注册到 OOM 监控器
+//   2. 发布 TaskStart/TaskExecStarted 事件
 func (s *service) Start(ctx context.Context, r *taskAPI.StartRequest) (*taskAPI.StartResponse, error) {
 	container, err := s.getContainer(r.ID)
 	if err != nil {
 		return nil, err
 	}
 
-	// hold the send lock so that the start events are sent before any exit events in the error case
+	// wy: 持有事件发送锁——确保 Start 事件在 Exit 事件之前发送
 	s.eventSendMu.Lock()
+	// wy: 🚀 核心: 调用 runc start 或 runc exec
 	p, err := container.Start(ctx, r)
 	if err != nil {
 		s.eventSendMu.Unlock()
@@ -372,16 +419,20 @@ func (s *service) Start(ctx context.Context, r *taskAPI.StartRequest) (*taskAPI.
 
 	switch r.ExecID {
 	case "":
+		// wy: 启动的是 init 进程——需要注册 OOM 监控
 		switch cg := container.Cgroup().(type) {
 		case cgroups.Cgroup:
+			// wy: cgroups v1: 监听 memory.oom_control eventfd
 			if err := s.ep.Add(container.ID, cg); err != nil {
 				logrus.WithError(err).Error("add cg to OOM monitor")
 			}
 		case *cgroupsv2.Manager:
+			// wy: cgroups v2: 监听 memory.events 中的 oom 计数
 			allControllers, err := cg.RootControllers()
 			if err != nil {
 				logrus.WithError(err).Error("failed to get root controllers")
 			} else {
+				// wy: 启用所有可用的 cgroup 控制器
 				if err := cg.ToggleControllers(allControllers, cgroupsv2.Enable); err != nil {
 					if userns.RunningInUserNS() {
 						logrus.WithError(err).Debugf("failed to enable controllers (%v)", allControllers)
@@ -395,11 +446,13 @@ func (s *service) Start(ctx context.Context, r *taskAPI.StartRequest) (*taskAPI.
 			}
 		}
 
+		// wy: 🚀 发布 TaskStart 事件
 		s.send(&eventstypes.TaskStart{
 			ContainerID: container.ID,
 			Pid:         uint32(p.Pid()),
 		})
 	default:
+		// wy: 启动的是 exec 进程——发布 TaskExecStarted 事件
 		s.send(&eventstypes.TaskExecStarted{
 			ContainerID: container.ID,
 			ExecID:      r.ExecID,

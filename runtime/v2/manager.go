@@ -45,11 +45,15 @@ type Config struct {
 }
 
 func init() {
+	// wy: 🚀 注册 v2 Runtime Plugin——这是 containerd 管理容器的核心插件
+	// ID: "task"，完整 URI: "io.containerd.runtime.v2.task"
+	// 职责: 管理 shim 进程的生命周期（创建/连接/删除 shim）
+	// 依赖: MetadataPlugin（从 BoltDB 读取容器元数据）
 	plugin.Register(&plugin.Registration{
 		Type: plugin.RuntimePluginV2,
 		ID:   "task",
 		Requires: []plugin.Type{
-			plugin.MetadataPlugin,
+			plugin.MetadataPlugin, // wy: 依赖 BoltDB 元数据（获取容器记录）
 		},
 		Config: &Config{
 			Platforms: defaultPlatforms(),
@@ -61,18 +65,25 @@ func init() {
 			}
 
 			ic.Meta.Platforms = supportedPlatforms
+			// wy: 创建 runtime 的 root 和 state 目录
+			// Root:  /var/lib/containerd/io.containerd.runtime.v2.task/  (持久化: 容器 working dir)
+			// State: /run/containerd/io.containerd.runtime.v2.task/      (运行时: OCI bundle, shim socket)
 			if err := os.MkdirAll(ic.Root, 0711); err != nil {
 				return nil, err
 			}
 			if err := os.MkdirAll(ic.State, 0711); err != nil {
 				return nil, err
 			}
+
+			// wy: 从 Metadata Plugin 获取容器存储接口
 			m, err := ic.Get(plugin.MetadataPlugin)
 			if err != nil {
 				return nil, err
 			}
 			cs := metadata.NewContainerStore(m.(*metadata.DB))
 
+			// wy: 🚀 创建 TaskManager——v2 runtime 的核心管理器
+			// 它负责: 启动 shim、连接 shim、管理 task 列表、daemon 重启时恢复 shim
 			return New(ic.Context, ic.Root, ic.State, ic.Address, ic.TTRPCAddress, ic.Events, cs)
 		},
 	})
@@ -100,16 +111,26 @@ func New(ctx context.Context, root, state, containerdAddress, containerdTTRPCAdd
 	return m, nil
 }
 
-// TaskManager manages v2 shim's and their tasks
+// TaskManager 管理所有 v2 shim 进程及其 task
+// wy: 🚀 核心职责:
+//   - Create: 为新容器启动 shim 进程，创建 task
+//   - Get/Delete/Tasks: 查询和管理 task
+//   - loadExistingTasks: daemon 重启时恢复之前存活的 shim 连接
+//
+// 数据结构:
+//   root:  /var/lib/containerd/io.containerd.runtime.v2.task/<namespace>/<container-id>/
+//          存放容器的 working 目录（overlayfs 的 upperdir/workdir）
+//   state: /run/containerd/io.containerd.runtime.v2.task/<namespace>/<container-id>/
+//          存放 OCI bundle（config.json, rootfs/）和 shim 的 TTRPC socket 地址
 type TaskManager struct {
-	root                   string
-	state                  string
-	containerdAddress      string
-	containerdTTRPCAddress string
+	root                   string // wy: 持久化目录（容器 working 目录）
+	state                  string // wy: 运行时状态目录（bundle + shim address）
+	containerdAddress      string // wy: containerd gRPC 地址（传递给 shim）
+	containerdTTRPCAddress string // wy: containerd TTRPC 地址（shim 通过此地址发布事件）
 
-	tasks      *runtime.TaskList
-	events     *exchange.Exchange
-	containers containers.Store
+	tasks      *runtime.TaskList  // wy: 当前所有运行中 task 的列表
+	events     *exchange.Exchange // wy: 全局事件总线（shim 退出事件通过此发布）
+	containers containers.Store   // wy: 容器元数据存储（BoltDB）
 }
 
 // ID of the task manager
@@ -117,33 +138,47 @@ func (m *TaskManager) ID() string {
 	return fmt.Sprintf("%s.%s", plugin.RuntimePluginV2, "task")
 }
 
-// Create a new task
+// Create 为新容器创建 task（启动 shim + 在 shim 中创建容器）
+// wy: 🚀 完整的创建流程:
+//   1. NewBundle: 创建 OCI bundle 目录，写入 config.json
+//   2. startShim: fork/exec containerd-shim-runc-v2 进程
+//   3. shim.Create: 通过 TTRPC 调用 shim 的 Create → runc create
+//
+// 任何步骤失败都会清理 bundle 和 shim（defer 回滚）
 func (m *TaskManager) Create(ctx context.Context, id string, opts runtime.CreateOpts) (_ runtime.Task, retErr error) {
+	// wy: Step 1: 创建 OCI bundle 目录
+	// 目录结构: /run/containerd/io.containerd.runtime.v2.task/<namespace>/<id>/
+	//   ├── config.json  ← OCI runtime spec（从 opts.Spec 解码写入）
+	//   └── rootfs/      ← 由 shim 挂载 overlayfs 到此目录
 	bundle, err := NewBundle(ctx, m.root, m.state, id, opts.Spec.Value)
 	if err != nil {
 		return nil, err
 	}
 	defer func() {
 		if retErr != nil {
-			bundle.Delete()
+			bundle.Delete() // wy: 失败时清理 bundle 目录
 		}
 	}()
 
+	// wy: Step 2: 启动 shim 进程
 	shim, err := m.startShim(ctx, bundle, id, opts)
 	if err != nil {
 		return nil, err
 	}
 	defer func() {
 		if retErr != nil {
-			m.deleteShim(shim)
+			m.deleteShim(shim) // wy: 失败时删除 shim
 		}
 	}()
 
+	// wy: Step 3: 通过 TTRPC 调用 shim 的 Task.Create
+	// shim 内部: runc.NewContainer() → 挂载 rootfs → runc create
 	t, err := shim.Create(ctx, opts)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create shim")
 	}
 
+	// wy: 将 task 加入运行时 task 列表
 	if err := m.tasks.Add(ctx, t); err != nil {
 		return nil, errors.Wrap(err, "failed to add task")
 	}
@@ -151,6 +186,22 @@ func (m *TaskManager) Create(ctx context.Context, id string, opts runtime.Create
 	return t, nil
 }
 
+// startShim 启动 shim 进程并建立 TTRPC 连接
+// wy: 🚀 Shim 启动协议（两次调用模式）:
+//
+//   第 1 次调用: containerd-shim-runc-v2 start
+//     → shim fork 自身，子进程作为 shim server 运行
+//     → 父进程将 TTRPC socket 地址打印到 stdout 后退出
+//     → containerd 从 stdout 读取地址
+//
+//   第 2 次调用: containerd-shim-runc-v2（无参数，作为 shim server 运行）
+//     → shim server 在 TTRPC socket 上监听
+//     → 注册 TaskService（Create/Start/Kill/Delete/Exec 等 RPC）
+//     → containerd 通过读取的地址建立 TTRPC 连接
+//
+// opts.Runtime 决定使用哪个 shim 二进制:
+//   "io.containerd.runc.v2" → containerd-shim-runc-v2
+//   "io.containerd.kata.v2" → containerd-shim-kata-v2（如果安装了的话）
 func (m *TaskManager) startShim(ctx context.Context, bundle *Bundle, id string, opts runtime.CreateOpts) (*shim, error) {
 	ns, err := namespaces.NamespaceRequired(ctx)
 	if err != nil {
@@ -162,15 +213,19 @@ func (m *TaskManager) startShim(ctx context.Context, bundle *Bundle, id string, 
 		topts = opts.RuntimeOptions
 	}
 
+	// wy: 🚀 构建 shim 二进制调用器
+	// shimBinary 根据 opts.Runtime 名称解析 shim 二进制路径
+	// 例如: "io.containerd.runc.v2" → "containerd-shim-runc-v2"
 	b := shimBinary(ctx, bundle, opts.Runtime, m.containerdAddress, m.containerdTTRPCAddress, m.events, m.tasks)
+
+	// wy: 启动 shim 进程
 	shim, err := b.Start(ctx, topts, func() {
+		// wy: 这是 shim 断开连接的回调——当 shim 进程异常退出时触发
 		log.G(ctx).WithField("id", id).Info("shim disconnected")
 
+		// wy: 🚀 清理死掉的 shim: 杀掉容器进程、发布退出事件
 		cleanupAfterDeadShim(context.Background(), id, ns, m.tasks, m.events, b)
-		// Remove self from the runtime task list. Even though the cleanupAfterDeadShim()
-		// would publish taskExit event, but the shim.Delete() would always failed with ttrpc
-		// disconnect and there is no chance to remove this dead task from runtime task lists.
-		// Thus it's better to delete it here.
+		// wy: 从 task 列表中移除（因为 TTRPC 已断开，无法再调用 shim.Delete()）
 		m.tasks.Delete(ctx, id)
 	})
 	if err != nil {

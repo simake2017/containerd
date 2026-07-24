@@ -21,7 +21,7 @@ import (
 	_ "github.com/containerd/containerd/diff/walking/plugin"
 	_ "github.com/containerd/containerd/gc/scheduler"
 	_ "github.com/containerd/containerd/runtime/restart/monitor"
-	_ "github.com/containerd/containerd/services/containers"
+	_ "github.com/containerd/containerd/services/containers" // 容器 grpc注册
 	_ "github.com/containerd/containerd/services/content"
 	_ "github.com/containerd/containerd/services/diff"
 	_ "github.com/containerd/containerd/services/events"

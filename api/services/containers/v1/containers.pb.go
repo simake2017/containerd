@@ -901,9 +901,15 @@ func _Containers_Delete_Handler(srv interface{}, ctx context.Context, dec func(i
 	return interceptor(ctx, in, info, handler)
 }
 
+//wangyang 注册相关 grpc 接口
+/*
+构建路径：gRPC 客户端会发起一个 POST 请求，路径就是 /{ServiceName}/{MethodName}。
+设置 Content-Type：HTTP Header 会被设置为 application/grpc。,grpc-server自定义类的类型，会自己解析相应数据
+传输数据：Protobuf 序列化后的二进制流被放在 HTTP 的 Body 中。
+*/
 var _Containers_serviceDesc = grpc.ServiceDesc{
 	ServiceName: "containerd.services.containers.v1.Containers",
-	HandlerType: (*ContainersServer)(nil),
+	HandlerType: (*ContainersServer)(nil), // wangyang 需要指针类型, 主要用于类型校验，没有其他作用
 	Methods: []grpc.MethodDesc{
 		{
 			MethodName: "Get",
@@ -915,7 +921,7 @@ var _Containers_serviceDesc = grpc.ServiceDesc{
 		},
 		{
 			MethodName: "Create",
-			Handler:    _Containers_Create_Handler,
+			Handler:    _Containers_Create_Handler, // 容器创建 handler
 		},
 		{
 			MethodName: "Update",

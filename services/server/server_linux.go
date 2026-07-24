@@ -37,8 +37,8 @@ func apply(ctx context.Context, config *srvconfig.Config) error {
 			log.G(ctx).WithError(err).Errorf("failed to change OOM score to %d", config.OOMScore)
 		}
 	}
-	if config.Cgroup.Path != "" {
-		if cgroups.Mode() == cgroups.Unified {
+	if config.Cgroup.Path != "" { //这里是 path 不为空的情况
+		if cgroups.Mode() == cgroups.Unified { // 这里的这种方式就是cgroup的第二种方式,cgroup的原理暂存，疑问
 			cg, err := cgroupsv2.LoadManager("/sys/fs/cgroup", config.Cgroup.Path)
 			if err != nil {
 				if err != cgroupsv2.ErrCgroupDeleted {
@@ -52,6 +52,7 @@ func apply(ctx context.Context, config *srvconfig.Config) error {
 				return err
 			}
 		} else {
+			//v1 类型的cgroup
 			cg, err := cgroups.Load(cgroups.V1, cgroups.StaticPath(config.Cgroup.Path))
 			if err != nil {
 				if err != cgroups.ErrCgroupDeleted {

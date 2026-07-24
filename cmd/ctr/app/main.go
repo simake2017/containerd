@@ -82,7 +82,7 @@ containerd CLI
 			Name:   "address, a",
 			Usage:  "address for containerd's GRPC server",
 			Value:  defaults.DefaultAddress,
-			EnvVar: "CONTAINERD_ADDRESS",
+			EnvVar: "CONTAINERD_ADDRESS", // 使用的环境变量
 		},
 		cli.DurationFlag{
 			Name:  "timeout",
@@ -95,7 +95,7 @@ containerd CLI
 		cli.StringFlag{
 			Name:   "namespace, n",
 			Usage:  "namespace to use with commands",
-			Value:  namespaces.Default,
+			Value:  namespaces.Default, // 默认空间是 default
 			EnvVar: namespaces.NamespaceEnvVar,
 		},
 	}

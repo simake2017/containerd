@@ -207,7 +207,18 @@ func (c *container) Image(ctx context.Context) (Image, error) {
 	return NewImage(c.client, i), nil
 }
 
+// NewTask 创建容器的运行实例（Task）
+// wy: 🚀 这是整个容器生命周期中最关键的一步——从元数据到真正进程的跨越
+// 调用链:
+//   Client.NewTask() → gRPC: TaskService.Create → Daemon TaskManager →
+//   fork/exec shim → TTRPC: shim.Create → runc create
+//
+// 完成后: 容器已经被 runc create（namespaces/cgroups 已设置），但 init 进程被阻塞
+// 需要调用 task.Start() 才能解除阻塞让容器真正运行
 func (c *container) NewTask(ctx context.Context, ioCreate cio.Creator, opts ...NewTaskOpts) (_ Task, err error) {
+	// wy: Step 1: 创建 IO 管道
+	// cio.Creator 会在磁盘上创建 stdin/stdout/stderr 的 FIFO 命名管道
+	// 路径示例: /run/containerd/fifos/<id>-stdin, -stdout, -stderr
 	i, err := ioCreate(c.id)
 	if err != nil {
 		return nil, err
@@ -218,14 +229,18 @@ func (c *container) NewTask(ctx context.Context, ioCreate cio.Creator, opts ...N
 			i.Close()
 		}
 	}()
+
 	cfg := i.Config()
+	// wy: 构建 gRPC 请求——FIFO 路径会传递给 shim，shim 打开这些 FIFO 连接容器 IO
 	request := &tasks.CreateTaskRequest{
 		ContainerID: c.id,
 		Terminal:    cfg.Terminal,
-		Stdin:       cfg.Stdin,
-		Stdout:      cfg.Stdout,
+		Stdin:       cfg.Stdin,   // wy: FIFO 路径，shim 端打开并桥接到容器 stdin
+		Stdout:      cfg.Stdout,  // wy: FIFO 路径，shim 端将容器 stdout 写入此 FIFO
 		Stderr:      cfg.Stderr,
 	}
+
+	// wy: Step 2: 获取容器的 rootfs 挂载信息
 	r, err := c.get(ctx)
 	if err != nil {
 		return nil, err
@@ -235,7 +250,12 @@ func (c *container) NewTask(ctx context.Context, ioCreate cio.Creator, opts ...N
 			return nil, errors.Wrapf(errdefs.ErrInvalidArgument, "unable to resolve rootfs mounts without snapshotter on container")
 		}
 
-		// get the rootfs from the snapshotter and add it to the request
+		// wy: 🚀 核心: 从 Snapshotter 获取 rootfs 的挂载参数
+		// 对于 overlayfs，返回:
+		//   Type: "overlay"
+		//   Source: "overlay"
+		//   Options: ["workdir=/path/work", "upperdir=/path/upper", "lowerdir=/path/lower1:/path/lower2:..."]
+		// Shim 拿到这些参数后执行 mount() 系统调用，将 rootfs 挂载到 bundle/rootfs/
 		s, err := c.client.getSnapshotter(ctx, r.Snapshotter)
 		if err != nil {
 			return nil, err
@@ -249,6 +269,7 @@ func (c *container) NewTask(ctx context.Context, ioCreate cio.Creator, opts ...N
 			return nil, err
 		}
 		for _, m := range mounts {
+			// wy: SELinux mount label 处理（安全标签）
 			if spec.Linux != nil && spec.Linux.MountLabel != "" {
 				context := label.FormatMountLabel("", spec.Linux.MountLabel)
 				if context != "" {
@@ -262,8 +283,10 @@ func (c *container) NewTask(ctx context.Context, ioCreate cio.Creator, opts ...N
 			})
 		}
 	}
+
+	// wy: Step 3: 应用 Task 级别的选项（如 checkpoint 恢复、自定义 rootfs 等）
 	info := TaskInfo{
-		runtime: r.Runtime.Name,
+		runtime: r.Runtime.Name, // wy: 如 "io.containerd.runc.v2"
 	}
 	for _, o := range opts {
 		if err := o(ctx, c.client, &info); err != nil {
@@ -280,12 +303,15 @@ func (c *container) NewTask(ctx context.Context, ioCreate cio.Creator, opts ...N
 		}
 	}
 	if info.Options != nil {
+		// wy: 将 runtime 特定选项序列化为 protobuf Any
+		// 例如 runc 的 options.Options: SystemdCgroup, BinaryName, Root 等
 		any, err := typeurl.MarshalAny(info.Options)
 		if err != nil {
 			return nil, err
 		}
 		request.Options = any
 	}
+
 	t := &task{
 		client: c.client,
 		io:     i,
@@ -295,11 +321,19 @@ func (c *container) NewTask(ctx context.Context, ioCreate cio.Creator, opts ...N
 	if info.Checkpoint != nil {
 		request.Checkpoint = info.Checkpoint
 	}
+
+	// wy: Step 4: 🚀 gRPC 调用 TaskService.Create
+	// → Daemon: services/tasks/local.go Create()
+	//   → runtime/v2 TaskManager.Create()
+	//     → NewBundle() 创建 OCI bundle 目录 + 写入 config.json
+	//     → startShim() fork/exec containerd-shim-runc-v2
+	//     → TTRPC: shim.Task.Create()
+	//       → runc.NewContainer() → runc create <id> --bundle <path>
 	response, err := c.client.TaskService().Create(ctx, request)
 	if err != nil {
 		return nil, errdefs.FromGRPC(err)
 	}
-	t.pid = response.Pid
+	t.pid = response.Pid // wy: 容器 init 进程的 PID（由 runc 返回，经过 shim → daemon → client 传递）
 	return t, nil
 }
 

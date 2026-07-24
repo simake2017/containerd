@@ -34,43 +34,50 @@ import (
 	"github.com/pkg/errors"
 )
 
-// Layer represents the descriptors for a layer diff. These descriptions
-// include the descriptor for the uncompressed tar diff as well as a blob
-// used to transport that tar. The blob descriptor may or may not describe
-// a compressed object.
+// Layer 表示镜像一层的描述信息
+// wy: 🚀 每层包含两个 descriptor:
+//   Diff: 解压后的 tar diff 描述符（用于计算 chain ID）
+//   Blob: 原始压缩 blob 描述符（实际从 Content Store 读取的数据）
+// 例如: Blob 是 layer.tar.gz（compressed），Diff 是 layer.tar（uncompressed）
 type Layer struct {
-	Diff ocispec.Descriptor
-	Blob ocispec.Descriptor
+	Diff ocispec.Descriptor // wy: 解压后的 diff descriptor（digest 用于 chain ID 计算）
+	Blob ocispec.Descriptor // wy: 原始压缩 blob descriptor（从 Content Store 读取）
 }
 
-// ApplyLayers applies all the layers using the given snapshotter and applier.
-// The returned result is a chain id digest representing all the applied layers.
-// Layers are applied in order they are given, making the first layer the
-// bottom-most layer in the layer chain.
+// ApplyLayers 将所有镜像层依次应用到 Snapshotter，生成完整的 rootfs
+// wy: 🚀 这是镜像解包的核心函数——将 Docker/OCI 镜像的各层 tar 包解压为文件系统快照
+//
+// 工作原理（以 3 层镜像为例）:
+//   Layer 1 (base): Prepare("extract-1", "") → tar 解压 → Commit("chain-1", "extract-1")
+//   Layer 2 (app):  Prepare("extract-2", "chain-1") → tar 解压 → Commit("chain-2", "extract-2")
+//   Layer 3 (cfg):  Prepare("extract-3", "chain-2") → tar 解压 → Commit("chain-3", "extract-3")
+//
+// 最终 chain-3 包含了所有层的合并视图（通过 overlayfs lowerdir 链实现）
+// chain ID 的计算: sha256(sha256(layer1) + sha256(layer2) + sha256(layer3))
 func ApplyLayers(ctx context.Context, layers []Layer, sn snapshots.Snapshotter, a diff.Applier) (digest.Digest, error) {
 	return ApplyLayersWithOpts(ctx, layers, sn, a, nil)
 }
 
-// ApplyLayersWithOpts applies all the layers using the given snapshotter, applier, and apply opts.
-// The returned result is a chain id digest representing all the applied layers.
-// Layers are applied in order they are given, making the first layer the
-// bottom-most layer in the layer chain.
+// ApplyLayersWithOpts 带选项的逐层应用
 func ApplyLayersWithOpts(ctx context.Context, layers []Layer, sn snapshots.Snapshotter, a diff.Applier, applyOpts []diff.ApplyOpt) (digest.Digest, error) {
+	// wy: 构建 chain: 每层的 Diff digest 组成有序数组
 	chain := make([]digest.Digest, len(layers))
 	for i, layer := range layers {
 		chain[i] = layer.Diff.Digest
 	}
+	// wy: 计算最终的 Chain ID = sha256(digest1 + digest2 + ... + digestN)
+	// Chain ID 是唯一标识一组层叠序列的指纹
 	chainID := identity.ChainID(chain)
 
-	// Just stat top layer, remaining layers will have their existence checked
-	// on prepare. Calling prepare on upper layers first guarantees that upper
-	// layers are not removed while calling stat on lower layers
+	// wy: 幂等性检查: 先检查最终层的 snapshot 是否已存在
+	// 如果存在说明整个镜像已经解包过了，直接返回（避免重复解压）
 	_, err := sn.Stat(ctx, chainID.String())
 	if err != nil {
 		if !errdefs.IsNotFound(err) {
 			return "", errors.Wrapf(err, "failed to stat snapshot %s", chainID)
 		}
 
+		// wy: 不存在，开始逐层解包
 		if err := applyLayers(ctx, layers, chain, sn, a, nil, applyOpts); err != nil && !errdefs.IsAlreadyExists(err) {
 			return "", err
 		}
@@ -111,11 +118,23 @@ func ApplyLayerWithOpts(ctx context.Context, layer Layer, chain []digest.Digest,
 
 }
 
+// applyLayers 逐层应用镜像层到 Snapshotter 的内部实现
+// wy: 🚀 核心逻辑（递归 + 迭代）:
+//   1. 递归确保 parent 层已存在（如果 parent 不存在，先递归应用前面的层）
+//   2. Prepare 一个 Active 快照（基于 parent）
+//   3. 将 layer 的 tar 包通过 diff.Applier 解压到快照的挂载点
+//   4. Commit 为 Committed 快照（以 chainID 为名称）
+//
+// overlayfs 视角:
+//   Layer 1: lowerdir=/var/lib/.../snapshots/1/fs (base layer)
+//   Layer 2: lowerdir=/var/lib/.../snapshots/2/fs:/var/lib/.../snapshots/1/fs
+//   Layer 3: lowerdir=/var/lib/.../snapshots/3/fs:.../2/fs:.../1/fs
+//   容器:    lowerdir=3:2:1, upperdir=/var/lib/.../snapshots/4/fs, workdir=...
 func applyLayers(ctx context.Context, layers []Layer, chain []digest.Digest, sn snapshots.Snapshotter, a diff.Applier, opts []snapshots.Opt, applyOpts []diff.ApplyOpt) error {
 	var (
-		parent  = identity.ChainID(chain[:len(chain)-1])
-		chainID = identity.ChainID(chain)
-		layer   = layers[len(layers)-1]
+		parent  = identity.ChainID(chain[:len(chain)-1]) // wy: 前一层的 chain ID
+		chainID = identity.ChainID(chain)                 // wy: 当前层的 chain ID
+		layer   = layers[len(layers)-1]                   // wy: 当前要应用的层
 		diff    ocispec.Descriptor
 		key     string
 		mounts  []mount.Mount
@@ -123,26 +142,27 @@ func applyLayers(ctx context.Context, layers []Layer, chain []digest.Digest, sn 
 	)
 
 	for {
+		// wy: 生成唯一的快照 key（格式: "extract-<random> <chainID>"）
 		key = fmt.Sprintf(snapshots.UnpackKeyFormat, uniquePart(), chainID)
 
-		// Prepare snapshot with from parent, label as root
+		// wy: 🚀 Step 1: 从 parent 创建 Active 快照
+		// 对于 overlayfs: 创建 upperdir + workdir，挂载时 lowerdir 指向 parent
 		mounts, err = sn.Prepare(ctx, key, parent.String(), opts...)
 		if err != nil {
 			if errdefs.IsNotFound(err) && len(layers) > 1 {
+				// wy: parent 不存在 → 递归应用前面的层（确保依赖链完整）
 				if err := applyLayers(ctx, layers[:len(layers)-1], chain[:len(chain)-1], sn, a, opts, applyOpts); err != nil {
 					if !errdefs.IsAlreadyExists(err) {
 						return err
 					}
 				}
-				// Do no try applying layers again
-				layers = nil
+				layers = nil // wy: 标记前面的层已应用，不再重试
 				continue
 			} else if errdefs.IsAlreadyExists(err) {
-				// Try a different key
+				// wy: key 冲突（极低概率），换一个随机 key 重试
 				continue
 			}
 
-			// Already exists should have the caller retry
 			return errors.Wrapf(err, "failed to prepare extraction snapshot %q", key)
 
 		}

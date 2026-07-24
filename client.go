@@ -71,7 +71,13 @@ import (
 
 func init() {
 	const prefix = "types.containerd.io"
-	// register TypeUrls for commonly marshaled external types
+	// wy: 🚀 注册 OCI runtime-spec 类型到 typeurl 全局表
+	// typeurl 机制: 将 Go struct 映射为唯一的 Type URL 字符串
+	// 用途: 当 struct 被序列化为 protobuf Any 时，Type URL 标识其原始类型
+	// 反序列化时通过 Type URL 查找对应的 Go struct 进行还原
+	//
+	// 例如: specs.Spec 的 Type URL = "types.containerd.io/opencontainers/runtime-spec/1/Spec"
+	// 这使得 Task.Exec() 传递的 Process Spec 能跨 gRPC 边界正确序列化/反序列化
 	major := strconv.Itoa(specs.VersionMajor)
 	typeurl.Register(&specs.Spec{}, prefix, "opencontainers/runtime-spec", major, "Spec")
 	typeurl.Register(&specs.Process{}, prefix, "opencontainers/runtime-spec", major, "Process")
@@ -79,8 +85,16 @@ func init() {
 	typeurl.Register(&specs.WindowsResources{}, prefix, "opencontainers/runtime-spec", major, "WindowsResources")
 }
 
-// New returns a new containerd client that is connected to the containerd
-// instance provided by address
+// New 创建 containerd Client，连接到指定地址的 containerd daemon
+// wy: 🚀 核心流程:
+//   1. 解析 ClientOpt 选项（默认 namespace、runtime、platform 等）
+//   2. 通过 Unix Domain Socket 建立 gRPC 连接
+//   3. 配置 Namespace 拦截器（自动注入 namespace 到每个 gRPC 请求）
+//   4. 检查 namespace label 中是否有自定义的默认 runtime
+//
+// 典型用法:
+//   client, err := containerd.New("/run/containerd/containerd.sock",
+//       containerd.WithDefaultNamespace("default"))
 func New(address string, opts ...ClientOpt) (*Client, error) {
 	var copts clientOpts
 	for _, o := range opts {
@@ -96,42 +110,52 @@ func New(address string, opts ...ClientOpt) (*Client, error) {
 		defaultns: copts.defaultns,
 	}
 
+	// wy: 设置默认 runtime——决定创建容器时使用哪个 shim 二进制
+	// 默认值: "io.containerd.runc.v2" → 查找 containerd-shim-runc-v2
 	if copts.defaultRuntime != "" {
 		c.runtime = copts.defaultRuntime
 	} else {
 		c.runtime = defaults.DefaultRuntime
 	}
 
+	// wy: 设置默认平台匹配器——拉取镜像时用于过滤目标平台
+	// 默认值: 当前机器的 OS/Arch（如 linux/amd64）
 	if copts.defaultPlatform != nil {
 		c.platform = copts.defaultPlatform
 	} else {
 		c.platform = platforms.Default()
 	}
 
+	// wy: 如果外部直接注入了服务实例（嵌入式场景），跳过 gRPC 连接
 	if copts.services != nil {
 		c.services = *copts.services
 	}
+
 	if address != "" {
 		backoffConfig := backoff.DefaultConfig
 		backoffConfig.MaxDelay = 3 * time.Second
 		connParams := grpc.ConnectParams{
 			Backoff: backoffConfig,
 		}
+		// wy: 🚀 gRPC 连接选项配置
 		gopts := []grpc.DialOption{
-			grpc.WithBlock(),
-			grpc.WithInsecure(),
+			grpc.WithBlock(),                          // wy: 阻塞直到连接建立
+			grpc.WithInsecure(),                       // wy: Unix socket 不需要 TLS
 			grpc.FailOnNonTempDialError(true),
 			grpc.WithConnectParams(connParams),
-			grpc.WithContextDialer(dialer.ContextDialer),
+			grpc.WithContextDialer(dialer.ContextDialer), // wy: 自定义 dialer 支持 unix:// scheme
 			grpc.WithReturnConnectionError(),
-
-			// TODO(stevvooe): We may need to allow configuration of this on the client.
-			grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(defaults.DefaultMaxRecvMsgSize)),
-			grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(defaults.DefaultMaxSendMsgSize)),
+			grpc.WithDefaultCallOptions(
+				grpc.MaxCallRecvMsgSize(defaults.DefaultMaxRecvMsgSize), // wy: 默认 16MB
+				grpc.MaxCallSendMsgSize(defaults.DefaultMaxSendMsgSize),
+			),
 		}
 		if len(copts.dialOptions) > 0 {
 			gopts = copts.dialOptions
 		}
+
+		// wy: 🚀 Namespace 拦截器——在每个 gRPC 请求的 metadata 中自动注入 namespace
+		// 这避免了每个 API 调用都手动传递 namespace
 		if copts.defaultns != "" {
 			unary, stream := newNSInterceptors(copts.defaultns)
 			gopts = append(gopts,
@@ -139,6 +163,10 @@ func New(address string, opts ...ClientOpt) (*Client, error) {
 				grpc.WithStreamInterceptor(stream),
 			)
 		}
+
+		// wy: 🚀 核心底层交互: 建立到 containerd daemon 的 gRPC 连接
+		// address 格式: "unix:///run/containerd/containerd.sock"
+		// dialer.DialAddress 将地址转换为 dialer 可识别的格式
 		connector := func() (*grpc.ClientConn, error) {
 			ctx, cancel := context.WithTimeout(context.Background(), copts.timeout)
 			defer cancel()
@@ -158,7 +186,8 @@ func New(address string, opts ...ClientOpt) (*Client, error) {
 		return nil, errors.Wrap(errdefs.ErrUnavailable, "no grpc connection or services is available")
 	}
 
-	// check namespace labels for default runtime
+	// wy: 检查 namespace 的 label 中是否有自定义的默认 runtime
+	// 例如: namespace "k8s.io" 可能配置了不同的 runtime
 	if copts.defaultRuntime == "" && c.defaultns != "" {
 		if label, err := c.GetLabel(context.Background(), defaults.DefaultRuntimeNSLabel); err != nil {
 			return nil, err
@@ -200,16 +229,21 @@ func NewWithConn(conn *grpc.ClientConn, opts ...ClientOpt) (*Client, error) {
 	return c, nil
 }
 
-// Client is the client to interact with containerd and its various services
-// using a uniform interface
+// Client 是与 containerd daemon 交互的客户端对象
+// wy: 🚀 核心设计:
+//   - 内嵌 services struct: 持有各子系统（ContentStore、Snapshotter 等）的直接引用或代理
+//   - 每个 XxxService() 方法有两条路径:
+//     1. 如果 services 中已注入实例（嵌入式 containerd 场景）→ 直接返回
+//     2. 否则通过 gRPC conn 创建 proxy 对象（远程调用场景）
+//   - 所有操作通过 gRPC 发送到 daemon 进程处理，Client 本身不包含运行时逻辑
 type Client struct {
-	services
+	services                                    // wy: 内嵌服务集合（各子系统的引用或 gRPC proxy）
 	connMu    sync.Mutex
-	conn      *grpc.ClientConn
-	runtime   string
-	defaultns string
-	platform  platforms.MatchComparer
-	connector func() (*grpc.ClientConn, error)
+	conn      *grpc.ClientConn                  // wy: 到 daemon 的 gRPC 连接
+	runtime   string                            // wy: 默认 runtime，如 "io.containerd.runc.v2"
+	defaultns string                            // wy: 默认 namespace，如 "default"
+	platform  platforms.MatchComparer           // wy: 平台匹配器，如 linux/amd64
+	connector func() (*grpc.ClientConn, error)  // wy: 重连工厂函数（用于 Reconnect()）
 }
 
 // Reconnect re-establishes the GRPC connection to the containerd daemon
@@ -266,8 +300,19 @@ func (c *Client) Containers(ctx context.Context, filters ...string) ([]Container
 	return out, nil
 }
 
-// NewContainer will create a new container in container with the provided id
-// the id must be unique within the namespace
+// NewContainer 在 containerd 中创建一个新的容器元数据记录
+// wy: 🚀 重要概念: NewContainer 只创建元数据，不启动任何进程！
+// 实际的容器进程在调用 container.NewTask() 时才启动
+//
+// 典型用法（函数式选项模式）:
+//   container, err := client.NewContainer(ctx, "web",
+//       containerd.WithImage(image),           // 设置容器使用的镜像
+//       containerd.WithNewSnapshot("web-snap", image), // 从镜像创建可写快照
+//       containerd.WithNewSpec(oci.WithImageConfig(image)), // 生成 OCI spec
+//   )
+//
+// WithLease 的作用: 在创建过程中防止 GC 回收引用的 content/snapshot
+// 因为创建容器涉及多个步骤，中间状态可能被 GC 误删
 func (c *Client) NewContainer(ctx context.Context, id string, opts ...NewContainerOpts) (Container, error) {
 	ctx, done, err := c.WithLease(ctx)
 	if err != nil {
@@ -275,17 +320,27 @@ func (c *Client) NewContainer(ctx context.Context, id string, opts ...NewContain
 	}
 	defer done(ctx)
 
+	// wy: 构建 Container 基础结构——ID 和 Runtime 信息
 	container := containers.Container{
 		ID: id,
 		Runtime: containers.RuntimeInfo{
-			Name: c.runtime,
+			Name: c.runtime, // wy: 如 "io.containerd.runc.v2"
 		},
 	}
+
+	// wy: 🚀 应用所有选项函数（函数式选项模式）
+	// 每个 NewContainerOpts 可以修改 container 的字段:
+	//   WithImage      → container.Image = "docker.io/library/nginx:latest"
+	//   WithSnapshotter → container.Snapshotter = "overlayfs"
+	//   WithNewSnapshot → container.SnapshotKey = "web-snap" + 调用 snapshotter.Prepare()
+	//   WithNewSpec    → container.Spec = OCI spec JSON（protobuf Any）
 	for _, o := range opts {
 		if err := o(ctx, c, &container); err != nil {
 			return nil, err
 		}
 	}
+
+	// wy: 🚀 gRPC 调用: ContainerService.Create → Daemon → 写入 BoltDB
 	r, err := c.ContainerService().Create(ctx, container)
 	if err != nil {
 		return nil, err
@@ -599,7 +654,12 @@ func (c *Client) ContainerService() containers.Store {
 	return NewRemoteContainerStore(containersapi.NewContainersClient(c.conn))
 }
 
-// ContentStore returns the underlying content Store
+// ContentStore 获取底层的内容存储接口
+// wy: 🚀 两条路径:
+//   1. 如果 c.contentStore 已注入（嵌入式场景）→ 直接返回本地 content.Store
+//   2. 否则创建 gRPC proxy → 通过 gRPC 调用 daemon 的 Content Service
+//      proxy 内部: 每个方法调用都转化为 gRPC 请求发送到 daemon
+// Content Store 存储所有镜像 blob（layer、config、manifest），基于 CAS（Content Addressable Storage）
 func (c *Client) ContentStore() content.Store {
 	if c.contentStore != nil {
 		return c.contentStore
@@ -609,7 +669,20 @@ func (c *Client) ContentStore() content.Store {
 	return contentproxy.NewContentStore(contentapi.NewContentClient(c.conn))
 }
 
-// SnapshotService returns the underlying snapshotter for the provided snapshotter name
+// SnapshotService 获取指定名称的快照器接口
+// wy: 🚀 核心概念:
+//   Snapshotter 负责文件系统层的叠合管理（overlayfs/native/devmapper）
+//   每个镜像层对应一个 Committed 快照，容器的可写层对应一个 Active 快照
+//
+//   snapshotterName 参数:
+//     "" → 使用默认值（overlayfs on Linux）
+//     "overlayfs" → overlayfs 联合文件系统（推荐）
+//     "native" → 直接文件拷贝（兼容性好但性能差）
+//     "devmapper" → 块设备 thin-provisioning（适合写密集型场景）
+//
+//   两条路径:
+//     1. 嵌入式: c.snapshotters[name] 直接返回本地 Snapshotter 实例
+//     2. 远程: snproxy.NewSnapshotter → gRPC proxy
 func (c *Client) SnapshotService(snapshotterName string) snapshots.Snapshotter {
 	snapshotterName, err := c.resolveSnapshotterName(context.Background(), snapshotterName)
 	if err != nil {

@@ -45,7 +45,7 @@ type InitContext struct {
 func NewContext(ctx context.Context, r *Registration, plugins *Set, root, state string) *InitContext {
 	return &InitContext{
 		Context: ctx,
-		Root:    filepath.Join(root, r.URI()),
+		Root:    filepath.Join(root, r.URI()), // wangyang 这里是创建插件根目录 一般就是/var/lib/containerd/uri 这样的目录
 		State:   filepath.Join(state, r.URI()),
 		Meta: &Meta{
 			Exports: map[string]string{},
@@ -125,7 +125,7 @@ func (ps *Set) Add(p *Plugin) error {
 // Get returns the first plugin by its type
 func (ps *Set) Get(t Type) (interface{}, error) {
 	for _, v := range ps.byTypeAndID[t] {
-		return v.Instance()
+		return v.Instance() // wangyang 找到任何一个该类型的 Plugin
 	}
 	return nil, errors.Wrapf(errdefs.ErrNotFound, "no plugins registered for %s", t)
 }

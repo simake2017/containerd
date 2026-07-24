@@ -31,31 +31,48 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
-// Pull downloads the provided content into containerd's content store
-// and returns a platform specific image object
+// Pull 从远程仓库拉取镜像到 containerd 的 Content Store 并解包到 Snapshotter
+// wy: 🚀 这是 containerd 最复杂的 Client 方法之一，完整流程:
+//
+//   1. 解析镜像引用（如 "docker.io/library/nginx:latest"）
+//   2. 认证: 向 registry 获取 Bearer Token
+//   3. 下载 manifest list（多平台索引）
+//   4. 按平台过滤，选择目标 manifest
+//   5. 下载 manifest + image config + 所有 layer blobs
+//   6. 并行解包: 边下载边将 layer tar 解压到 Snapshotter（overlayfs）
+//   7. 创建 Image 记录到 ImageService（BoltDB）
+//
+// 典型用法:
+//   image, err := client.Pull(ctx, "docker.io/library/nginx:latest",
+//       containerd.WithPullUnpack,              // 拉取后解包
+//       containerd.WithPullSnapshotter("overlayfs"), // 指定快照器
+//   )
 func (c *Client) Pull(ctx context.Context, ref string, opts ...RemoteOpt) (_ Image, retErr error) {
 	pullCtx := defaultRemoteContext()
+	// wy: 应用拉取选项（平台、并发数、解包等）
 	for _, o := range opts {
 		if err := o(c, pullCtx); err != nil {
 			return nil, err
 		}
 	}
 
+	// wy: 设置平台匹配器——决定拉取哪个平台的镜像
+	// 多平台镜像（如 nginx:latest 有 amd64/arm64/arm/v7）只拉取匹配的
 	if pullCtx.PlatformMatcher == nil {
 		if len(pullCtx.Platforms) > 1 {
 			return nil, errors.New("cannot pull multiplatform image locally, try Fetch")
 		} else if len(pullCtx.Platforms) == 0 {
-			pullCtx.PlatformMatcher = c.platform
+			pullCtx.PlatformMatcher = c.platform // wy: 默认: 当前机器的 OS/Arch
 		} else {
 			p, err := platforms.Parse(pullCtx.Platforms[0])
 			if err != nil {
 				return nil, errors.Wrapf(err, "invalid platform %s", pullCtx.Platforms[0])
 			}
-
 			pullCtx.PlatformMatcher = platforms.Only(p)
 		}
 	}
 
+	// wy: 创建 Lease 防止拉取过程中 GC 回收临时 content
 	ctx, done, err := c.WithLease(ctx)
 	if err != nil {
 		return nil, err
@@ -67,7 +84,10 @@ func (c *Client) Pull(ctx context.Context, ref string, opts ...RemoteOpt) (_ Ima
 	var unpackWrapper func(f images.Handler) images.Handler
 
 	if pullCtx.Unpack {
-		// unpacker only supports schema 2 image, for schema 1 this is noop.
+		// wy: 🚀 创建解包器——实现"边下载边解包"的流水线
+		// 解包器的 handler 包裹在 fetch handler 外层:
+		//   下载完一个 layer blob → 立即触发解包（tar 解压到 snapshotter）
+		//   同时继续下载下一个 layer
 		u, err := c.newUnpacker(ctx, pullCtx)
 		if err != nil {
 			return nil, errors.Wrap(err, "create unpacker")
@@ -89,14 +109,13 @@ func (c *Client) Pull(ctx context.Context, ref string, opts ...RemoteOpt) (_ Ima
 		}
 	}
 
+	// wy: 🚀 核心下载流程——递归分发下载所有 descriptor
 	img, err := c.fetch(ctx, pullCtx, ref, 1)
 	if err != nil {
 		return nil, err
 	}
 
-	// NOTE(fuweid): unpacker defers blobs download. before create image
-	// record in ImageService, should wait for unpacking(including blobs
-	// download).
+	// wy: 等待所有解包操作完成（包括 blob 下载 + tar 解压）
 	if pullCtx.Unpack {
 		if unpackEg != nil {
 			if err := unpackEg.Wait(); err != nil {
@@ -105,6 +124,7 @@ func (c *Client) Pull(ctx context.Context, ref string, opts ...RemoteOpt) (_ Ima
 		}
 	}
 
+	// wy: 创建 Image 记录到 ImageService（写入 BoltDB）
 	img, err = c.createNewImage(ctx, img)
 	if err != nil {
 		return nil, err
@@ -114,8 +134,7 @@ func (c *Client) Pull(ctx context.Context, ref string, opts ...RemoteOpt) (_ Ima
 
 	if pullCtx.Unpack {
 		if unpacks == 0 {
-			// Try to unpack is none is done previously.
-			// This is at least required for schema 1 image.
+			// wy: 兼容 schema1 镜像——之前没有触发解包，补一次
 			if err := i.Unpack(ctx, pullCtx.Snapshotter, pullCtx.UnpackOpts...); err != nil {
 				return nil, errors.Wrapf(err, "failed to unpack image on snapshotter %s", pullCtx.Snapshotter)
 			}
@@ -125,13 +144,34 @@ func (c *Client) Pull(ctx context.Context, ref string, opts ...RemoteOpt) (_ Ima
 	return i, nil
 }
 
+// fetch 执行实际的镜像下载
+// wy: 🚀 下载流程（以 docker.io/library/nginx:latest 为例）:
+//
+//   1. Resolve: HTTP GET registry → 获取 manifest list descriptor
+//   2. Fetcher: 获取 HTTP fetcher 客户端
+//   3. Dispatch: 递归遍历 descriptor 树，对每个执行 handler 链:
+//
+//      [manifest list] → FetchHandler(下载到 ContentStore)
+//                      → ChildrenHandler(解析子 descriptor，按平台过滤)
+//      [manifest]      → FetchHandler → ChildrenHandler(获取 config + layers)
+//      [config JSON]   → FetchHandler
+//      [layer 1 blob]  → FetchHandler → UnpackHandler(tar 解压到 snapshotter)
+//      [layer 2 blob]  → FetchHandler → UnpackHandler
+//      ...
+//
+//   每个 blob 写入路径: /var/lib/containerd/.../blobs/sha256/<digest>
 func (c *Client) fetch(ctx context.Context, rCtx *RemoteContext, ref string, limit int) (images.Image, error) {
 	store := c.ContentStore()
+
+	// wy: Step 1: 解析镜像引用
+	// "docker.io/library/nginx:latest" → (name="docker.io/library/nginx", descriptor)
+	// 底层: HTTP GET registry 的 manifest 端点
 	name, desc, err := rCtx.Resolver.Resolve(ctx, ref)
 	if err != nil {
 		return images.Image{}, errors.Wrapf(err, "failed to resolve reference %q", ref)
 	}
 
+	// wy: Step 2: 获取 Fetcher（HTTP 下载客户端）
 	fetcher, err := rCtx.Resolver.Fetcher(ctx, name)
 	if err != nil {
 		return images.Image{}, errors.Wrapf(err, "failed to get fetcher for %q", name)
