@@ -302,7 +302,7 @@ func applyFlags(context *cli.Context, config *srvconfig.Config) error {
 		},
 		{
 			name: "address",
-			d:    &config.GRPC.Address,
+			d:    &config.GRPC.Address, // wangyang获取相应的变量地址
 		},
 	} {
 		if s := context.GlobalString(v.name); s != "" {
